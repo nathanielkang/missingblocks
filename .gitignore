@@ -1,0 +1,16 @@
+results/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.env
+.venv/
+venv/
+GCP_STATUS.md
+scripts/gcp_*.sh
+*.log
+*.pid
+.DS_Store
+Thumbs.db
