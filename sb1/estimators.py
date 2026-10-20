@@ -110,6 +110,13 @@ class FitResult:
     feature_mean: np.ndarray | None = None
     solve: str = "solve"
     tests: tuple[TransportTest, ...] = ()
+    j_stat: float | None = None
+    j_df: int | None = None
+    j_pvalue: float | None = None
+    n_moments: int = 0
+    stacked_site_ids: tuple[int, ...] = ()
+    design: np.ndarray | None = None
+    moment_cross: np.ndarray | None = None
 
 
 def _basis_packets(sites: list[SiteSample], block: str) -> list[dict]:
@@ -273,53 +280,281 @@ def fit_transport(sites: list[SiteSample]) -> tuple[TransportMap, tuple[Transpor
     return amap, tuple(tests)
 
 
-def fit_gmm(sites: list[SiteSample], amap: TransportMap) -> FitResult:
-    """Two-step GMM on anchor sites. Moments are site-level normal equations."""
-    prepared: list[tuple[SiteSample, np.ndarray]] = []
-    for site in sites:
-        if not site.observes_anchor:
-            continue
-        regressor = transported_design(
-            site.federated_view(), site.mask, amap.gamma_b, amap.gamma_c
+@dataclass
+class _BlockMap:
+    """One transported block: dictionary h, pooled coefficient, donor rows."""
+
+    name: str
+    columns: np.ndarray
+    gamma: np.ndarray
+    donor_ids: tuple[int, ...]
+    h_inv: np.ndarray
+
+
+@dataclass
+class _OutcomeSite:
+    site_id: int
+    n: int
+    q: np.ndarray
+    xt: np.ndarray
+    y: np.ndarray
+    h_by_map: dict[str, np.ndarray]
+    offset: int = 0
+
+    @property
+    def width(self) -> int:
+        return int(self.q.shape[1])
+
+
+def _column_block(site: SiteSample, columns: np.ndarray) -> np.ndarray:
+    if not bool(site.mask[columns].all()):
+        raise ValueError(f"Site {site.site_id} does not record columns {columns.tolist()}.")
+    block = site.X[:, columns]
+    if not np.isfinite(block).all():
+        raise ValueError(f"Site {site.site_id} has a non-finite recorded block.")
+    return block
+
+
+def _anchor_basis(site: SiteSample) -> np.ndarray:
+    if not site.observes_anchor:
+        raise ValueError(f"Site {site.site_id} does not record the anchor.")
+    return phi(_column_block(site, IDX_A))
+
+
+def _known_instrument(site: SiteSample) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Instrument q of recorded features and dictionaries, and the transported regressor.
+
+    q does not depend on the conditional-mean coefficients. The manuscript's
+    influence is derived for that case: every coordinate of the transported
+    regressor is a linear function of q, with the coefficient in the map.
+    """
+    if not (bool(site.mask[IDX_B].all()) or bool(~site.mask[IDX_B].all())):
+        raise ValueError(f"Site {site.site_id} records only part of block B.")
+    if not (bool(site.mask[IDX_C].all()) or bool(~site.mask[IDX_C].all())):
+        raise ValueError(f"Site {site.site_id} records only part of block C.")
+    recorded = np.flatnonzero(site.mask)
+    parts = [_column_block(site, recorded)]
+    misses_nonanchor = (not bool(site.mask[IDX_B].all())) or (not bool(site.mask[IDX_C].all()))
+    basis = _anchor_basis(site) if site.observes_anchor and misses_nonanchor else None
+    if basis is not None:
+        parts.append(basis)
+    q = np.column_stack(parts)
+    xt = np.zeros((site.n, N_FEATURES), dtype=float)
+    xt[:, recorded] = site.X[:, recorded]
+    return q, xt, basis
+
+
+def _fill_transported(
+    site: SiteSample,
+    xt: np.ndarray,
+    basis: np.ndarray | None,
+    gamma_b: np.ndarray,
+    gamma_c: np.ndarray,
+) -> np.ndarray:
+    if not site.observes_anchor:
+        raise RuntimeError(
+            f"Site {site.site_id} does not record the anchor, so the declared dictionaries are not functions of its records."
         )
-        prepared.append((site, regressor))
-    if not prepared:
-        raise RuntimeError("No anchor site is available for the GMM.")
+    if not bool(site.mask[IDX_B].all()):
+        if basis is None:
+            raise RuntimeError(f"Site {site.site_id} misses block B without the anchor.")
+        xt[:, IDX_B] = basis @ gamma_b
+    if not bool(site.mask[IDX_C].all()):
+        if basis is None:
+            raise RuntimeError(f"Site {site.site_id} misses block C without the anchor.")
+        xt[:, IDX_C] = basis @ gamma_c
+    if not np.isfinite(xt).all():
+        raise ValueError(f"Site {site.site_id} has a non-finite transported regressor.")
+    return xt
 
-    def _normal(beta: np.ndarray | None) -> list[dict]:
-        packets = []
-        for site, regressor in prepared:
-            n = regressor.shape[0]
-            gram = (regressor.T @ regressor) / n
-            cross = (regressor.T @ site.y) / n
-            packet = {"n": n, "G": gram, "c": cross, "site_id": site.site_id}
-            if beta is not None:
-                residual = site.y - regressor @ beta
-                score = regressor * residual[:, None]
-                packet["Omega"] = (score.T @ score) / n
-            packets.append(packet)
-        return packets
 
-    first = _normal(None)
-    gram = sum(packet["n"] * packet["G"] for packet in first)
-    cross = sum(packet["n"] * packet["c"] for packet in first)
-    beta1, how1 = _solve(gram, cross)
-    second = _normal(beta1)
-    hessian = np.zeros((N_FEATURES, N_FEATURES))
-    rhs = np.zeros(N_FEATURES)
-    for packet in second:
-        omega = packet["Omega"]
-        ridge = 1e-8 * (np.trace(omega) / N_FEATURES + 1e-12)
-        weight = packet["n"] * np.linalg.inv(omega + ridge * np.eye(N_FEATURES))
-        hessian += packet["G"].T @ weight @ packet["G"]
-        rhs += packet["G"].T @ weight @ packet["c"]
-    beta2, how2 = _solve(hessian, rhs)
+def _map_inverse(raw_gram: np.ndarray, n_total: int) -> np.ndarray:
+    """Inverse of the donor Gram divided by the federation sample size."""
+    hat = raw_gram / float(n_total)
+    solved, _ = _solve(hat, np.eye(hat.shape[0]))
+    return solved
+
+
+def _build_block_map(
+    name: str,
+    columns: np.ndarray,
+    gamma: np.ndarray,
+    donor_ids: tuple[int, ...],
+    by_id: dict[int, SiteSample],
+    n_total: int,
+    basis_of,
+) -> _BlockMap:
+    raw = None
+    for site_id in donor_ids:
+        basis = basis_of(by_id[site_id])
+        gram = basis.T @ basis
+        raw = gram if raw is None else raw + gram
+    if raw is None:
+        raise RuntimeError(f"Block map {name} has no donors.")
+    return _BlockMap(
+        name=name,
+        columns=columns,
+        gamma=gamma,
+        donor_ids=tuple(int(site_id) for site_id in donor_ids),
+        h_inv=_map_inverse(raw, n_total),
+    )
+
+
+def _stabilize(omega: np.ndarray) -> np.ndarray:
+    sym = 0.5 * (omega + omega.T)
+    scale = float(np.trace(sym) / sym.shape[0]) + 1e-12
+    smallest = float(np.linalg.eigvalsh(sym)[0])
+    if smallest < 1e-8 * scale:
+        sym = sym + (1e-8 * scale) * np.eye(sym.shape[0])
+    return sym
+
+
+def fit_gmm(
+    sites: list[SiteSample],
+    amap: TransportMap,
+    *,
+    skip_outcome: tuple[int, ...] = (),
+) -> FitResult:
+    """Two-step GMM for the transported moment system.
+
+    The instrument at each site is the recorded feature vector, plus the
+    anchor dictionary when a non-anchor block is missing. The first step uses
+    the sample-size weight. The second step uses the inverse of the plug-in
+    covariance of the influence: the outcome score scaled by the inverse site
+    share, minus the donor term for every conditional mean that observation
+    helps fit. The donor Gram in that term is the raw sum divided by the
+    sample size of the sites that enter the influence.
+
+    Sites that do not record the anchor are not stacked. The declared maps
+    transport the non-anchor blocks given the anchor, and a site that never
+    records the anchor cannot evaluate those dictionaries. A fill of the
+    missing anchor from the intercept, or from the intercept and the second
+    block, leaves the outcome moments biased.
+    """
+    if not sites:
+        raise RuntimeError("The GMM received no sites.")
+    by_id = {int(site.site_id): site for site in sites}
+    skipped = {int(site_id) for site_id in skip_outcome}
+
+    outcome: list[_OutcomeSite] = []
+    for site in sorted(sites, key=lambda item: int(item.site_id)):
+        if int(site.site_id) in skipped or not site.observes_anchor:
+            continue
+        q, xt, basis = _known_instrument(site)
+        xt = _fill_transported(site, xt, basis, amap.gamma_b, amap.gamma_c)
+        h_anchor = basis if basis is not None else _anchor_basis(site)
+        outcome.append(
+            _OutcomeSite(
+                int(site.site_id),
+                site.n,
+                q,
+                xt,
+                site.y,
+                {"B": h_anchor, "C": h_anchor},
+            )
+        )
+    if not outcome:
+        raise RuntimeError("No site entered the outcome stack.")
+
+    offset = 0
+    for site in outcome:
+        site.offset = offset
+        offset += site.width
+    n_moments = offset
+    outcome_ids = {site.site_id for site in outcome}
+    participant_ids = set(outcome_ids)
+    participant_ids.update(int(site_id) for site_id in amap.donors_b)
+    participant_ids.update(int(site_id) for site_id in amap.donors_c)
+    missing = participant_ids.difference(by_id)
+    if missing:
+        raise RuntimeError(f"Donor sites {sorted(missing)} are not in the federation.")
+    n_total = int(sum(by_id[site_id].n for site_id in participant_ids))
+
+    def _basis_bc(site: SiteSample) -> np.ndarray:
+        return _anchor_basis(site)
+
+    maps: list[_BlockMap] = [
+        _build_block_map("B", IDX_B, amap.gamma_b, amap.donors_b, by_id, n_total, _basis_bc),
+        _build_block_map("C", IDX_C, amap.gamma_c, amap.donors_c, by_id, n_total, _basis_bc),
+    ]
+
+    recipient_of: dict[str, list[_OutcomeSite]] = {item.name: [] for item in maps}
+    for site in outcome:
+        sample = by_id[site.site_id]
+        for item in maps:
+            recorded = bool(sample.mask[item.columns].all())
+            if recorded or item.name not in site.h_by_map:
+                continue
+            recipient_of[item.name].append(site)
+
+    blocks_a = []
+    blocks_k = []
+    for site in outcome:
+        blocks_a.append((site.q.T @ site.xt) / site.n)
+        blocks_k.append((site.q.T @ site.y) / site.n)
+    hessian = np.zeros((N_FEATURES, N_FEATURES), dtype=float)
+    rhs = np.zeros(N_FEATURES, dtype=float)
+    for site, design, cross in zip(outcome, blocks_a, blocks_k):
+        hessian += site.n * (design.T @ design)
+        rhs += site.n * (design.T @ cross)
+    beta1, how1 = _solve(hessian, rhs)
+
+    outcome_by_id = {site.site_id: site for site in outcome}
+    cross_omega = np.zeros((n_moments, n_moments), dtype=float)
+    for sample in sites:
+        if int(sample.site_id) not in participant_ids:
+            continue
+        psi = np.zeros((sample.n, n_moments), dtype=float)
+        site = outcome_by_id.get(int(sample.site_id))
+        if site is not None:
+            residual = site.y - site.xt @ beta1
+            share = site.n / float(n_total)
+            psi[:, site.offset : site.offset + site.width] = (site.q * residual[:, None]) / share
+        for item in maps:
+            if int(sample.site_id) not in item.donor_ids:
+                continue
+            recipients = recipient_of[item.name]
+            if not recipients:
+                continue
+            basis = _anchor_basis(sample)
+            deviation = _column_block(sample, item.columns) - basis @ item.gamma
+            scale = deviation @ beta1[item.columns]
+            for recipient in recipients:
+                # Q H^{-1} is (r, d); each donor row contributes that factor times h and r' beta.
+                cross_h = recipient.q.T @ recipient.h_by_map[item.name]
+                factor = (cross_h / recipient.n) @ item.h_inv.T
+                loading = basis @ factor.T
+                psi[:, recipient.offset : recipient.offset + recipient.width] -= loading * scale[:, None]
+        cross_omega += psi.T @ psi
+    omega = _stabilize(cross_omega / float(n_total))
+
+    design = np.vstack(blocks_a)
+    cross = np.concatenate(blocks_k)
+    weighted, how_w = _solve(omega, np.column_stack([design, cross]))
+    hessian2 = design.T @ weighted[:, :N_FEATURES]
+    rhs2 = design.T @ weighted[:, N_FEATURES]
+    beta2, how2 = _solve(hessian2, rhs2)
+    moment = cross - design @ beta2
+    weighted_moment, _ = _solve(omega, moment)
+    j_stat = float(n_total * (moment @ weighted_moment))
+    if j_stat < 0.0 and j_stat > -1e-6:
+        j_stat = 0.0
+    j_df = int(n_moments - N_FEATURES)
+    j_p = float(chi2.sf(j_stat, j_df)) if j_df > 0 else float("nan")
+    how_second = how2 if how_w == "solve" else how_w
     return FitResult(
         method="federated_gmm",
         beta=beta2,
         gamma_b=amap.gamma_b,
         gamma_c=amap.gamma_c,
-        solve=f"{how1}/{how2}",
+        solve=f"{how1}/{how_second}",
+        j_stat=j_stat,
+        j_df=j_df,
+        j_pvalue=j_p,
+        n_moments=n_moments,
+        stacked_site_ids=tuple(site.site_id for site in outcome),
+        design=design,
+        moment_cross=cross,
     )
 
 

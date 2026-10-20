@@ -100,8 +100,9 @@ def run_replicate(
                         "n_test": held_test.n,
                     }
                 )
+    gmm_fit = fits["federated_gmm"]
     test_rows = []
-    for item in fits["federated_gmm"].tests:
+    for item in gmm_fit.tests:
         test_rows.append(
             {
                 "regime": regime,
@@ -117,11 +118,34 @@ def run_replicate(
                 "donor_ids": ",".join(str(site_id) for site_id in item.donor_ids),
             }
         )
+    n_stats = len(gmm_fit.tests)
+    bonferroni = 0.05 / (n_stats + 1) if n_stats else 0.05
+    j_p = gmm_fit.j_pvalue
+    overid_rows = [
+        {
+            "regime": regime,
+            "seed": seed,
+            "j_stat": gmm_fit.j_stat,
+            "j_df": gmm_fit.j_df,
+            "j_pvalue": j_p,
+            "reject_05": int(j_p is not None and j_p < 0.05),
+            "n_moments": gmm_fit.n_moments,
+            "n_donor_stats": n_stats,
+            "bonferroni_cutoff": bonferroni,
+            "reject_j_bonferroni": int(j_p is not None and j_p < bonferroni),
+            "reject_combined_bonferroni": int(
+                (j_p is not None and j_p < bonferroni)
+                or any(item.p_value < bonferroni for item in gmm_fit.tests)
+            ),
+            "stacked_sites": ",".join(str(site_id) for site_id in gmm_fit.stacked_site_ids),
+        }
+    ]
     return {
         "coefficients": coefficient_rows,
         "prediction": prediction_rows,
         "loso": loso_rows,
         "transport": test_rows,
+        "overid": overid_rows,
         "solves": {method: fits[method].solve for method in METHODS},
     }
 
@@ -210,7 +234,22 @@ def summarize(collected: dict, meta: dict) -> dict:
                 if row["regime"] == regime and row["map_name"] == map_name
             ]
             rejection[map_name] = float(np.mean(flags)) if flags else None
-        regimes[regime] = {"methods": methods, "transport_rejection_rate_05": rejection}
+        overid_rows = [
+            row for row in collected.get("overid", []) if row["regime"] == regime
+        ]
+        def _rate(key: str) -> float | None:
+            if not overid_rows:
+                return None
+            return float(np.mean([int(row[key]) for row in overid_rows]))
+
+        regimes[regime] = {
+            "methods": methods,
+            "transport_rejection_rate_05": rejection,
+            "j_rejection_rate_05": _rate("reject_05"),
+            "combined_bonferroni_rejection_rate": _rate("reject_combined_bonferroni"),
+            "j_df": None if not overid_rows else int(overid_rows[0]["j_df"]),
+            "n_moments": None if not overid_rows else int(overid_rows[0]["n_moments"]),
+        }
     return {
         "design": meta.get("design", design_record()),
         "run": {key: value for key, value in meta.items() if key != "design"},
@@ -230,7 +269,7 @@ def run_grid(
 ) -> dict:
     started = time.perf_counter()
     sites = apply_mean_scale(layout_sites(layout), mean_scale)
-    collected = {"coefficients": [], "prediction": [], "loso": [], "transport": []}
+    collected = {"coefficients": [], "prediction": [], "loso": [], "transport": [], "overid": []}
     solves = []
     for regime in regimes:
         for seed in seeds:
@@ -250,6 +289,7 @@ def run_grid(
     _write_csv(out_dir / "prediction_mse.csv", collected["prediction"])
     _write_csv(out_dir / "loso_mse.csv", collected["loso"])
     _write_csv(out_dir / "transport_tests.csv", collected["transport"])
+    _write_csv(out_dir / "overid.csv", collected["overid"])
     meta = {
         "seeds": list(seeds),
         "n_train_per_site": n_train,

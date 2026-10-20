@@ -309,7 +309,7 @@ def design_record(
             }
             for spec in chosen
         ],
-        "gmm_sites": "sites that record anchor A",
+        "gmm_sites": "sites that record anchor A; known instruments; influence weight with donor term",
         "plugin_sites": "all sites",
         "regimes": list(REGIMES),
     }
